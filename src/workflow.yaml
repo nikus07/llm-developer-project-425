@@ -1,0 +1,105 @@
+yawl: "0.1"
+start: select_overdue_tickets
+
+# Общая retry-политика для всех шагов сразу (databaseQuery, aiStudioAgent,
+# httpCall) — разовая ошибка YDB/AI Studio/сети не должна ронять весь
+# workflow. Ретраим только 5xx/timeout: STEP_PERMISSION_DENIED (например,
+# забытая роль SA) ими не лечится — это не временная ошибка.
+defaultRetryPolicy:
+  errorListMode: INCLUDE
+  errorList:
+    - STEP_TIMEOUT
+    - TIMEOUT
+    - HTTP_CALL_500
+    - HTTP_CALL_502
+    - HTTP_CALL_503
+    - HTTP_CALL_504
+    - DATABASE_QUERY_UNAVAILABLE
+    - YDB_CALL_SERVICE_UNAVAILABLE
+  initialDelay: 2s
+  backoffRate: 2.0
+  maxDelay: 30s
+  retryCount: 3
+
+steps:
+
+  # 1. Открытые тикеты, которые не обновлялись дольше порога (24 часа).
+  #    Для ручного теста временно замените PT24H на PT1H, чтобы в выборку
+  #    попали уже существующие тикеты, затем верните PT24H обратно.
+  select_overdue_tickets:
+    databaseQuery:
+      connection:                  # подключение к YDB — тот же
+        type: YDB                  # эндпоинт/база, что и в
+        host: ydb.serverless.yandexcloud.net   # scripts\deploy_ydb_tickets.ps1
+        port: 2135
+        database: /ru-central1/b1gjgpo4ro5npu1e344j/etn4esadbc57dpkus2n1
+        ssl: true
+        iam: true                  # workflow ходит в YDB от своего SA
+      query: |-
+        SELECT id, user_id, category, status, text, created_at, updated_at
+        FROM tickets
+        WHERE status = 'open'
+          AND updated_at < CurrentUtcTimestamp() - Interval('PT24H')
+      mode: QUERY
+      next: has_overdue_tickets
+
+  # 2. У switch нет поля default — обязателен catch-all condition: "true".
+  has_overdue_tickets:
+    switch:
+      choices:
+        - condition: "(.ResultSets[0] | length) > 0"
+          next: build_digest
+        - condition: "true"
+          next: nothing_to_escalate
+
+  # 3. Дайджест по выборке — тот же agent_id (promptTemplateId), что и в
+  #    шаге про настройку AI Studio. Untrusted-данные (текст обращений из
+  #    ResultSets) передаются только как содержимое message, а не
+  #    подмешиваются в системные инструкции агента.
+  build_digest:
+    aiStudioAgent:
+      promptTemplateId: "fvtiatu160sc9749ahan"   # агент из Agent Atelier (см. README)
+      message: 'Составь дайджест для оператора по этим просроченным тикетам службы поддержки (JSON, каждый объект — один тикет): \(.ResultSets[0])'
+      autoApprove: true
+      next: mark_escalated
+
+  # 4. То же условие, что и в SELECT на шаге 1 — чтобы пометить ровно те
+  #    тикеты, что попали в дайджест, и не захватить новые, просроченные
+  #    уже после шага 1 (иначе они пропустят собственный дайджест).
+  mark_escalated:
+    databaseQuery:
+      connection:
+        type: YDB
+        host: ydb.serverless.yandexcloud.net
+        port: 2135
+        database: /ru-central1/b1gjgpo4ro5npu1e344j/etn4esadbc57dpkus2n1
+        ssl: true
+        iam: true
+      query: |-
+        UPDATE tickets
+        SET status = 'escalated', updated_at = CurrentUtcTimestamp()
+        WHERE status = 'open'
+          AND updated_at < CurrentUtcTimestamp() - Interval('PT24H')
+      mode: EXEC
+      next: send_digest
+
+  # 5. YaWL не умеет сырой SMTP — HTTP-вызов на CF-обёртку email-sender
+  #    (src/email_sender/email_sender.py). httpCall не шлёт IAM-токен,
+  #    поэтому функция открыта без аутентификации; адресата (OPERATOR_EMAIL)
+  #    она берёт из своего окружения, а не из тела запроса — значит худшее,
+  #    что может получить тот, кто узнал URL, — лишний дайджест оператору.
+  send_digest:
+    httpCall:
+      url: "https://functions.yandexcloud.net/d4evkd35h3fvd0j3cgfv"   # TODO: id функции email-sender (yc serverless function get email-sender)
+      method: POST
+      headers:
+        Content-Type: application/json
+      body: '{"subject": "Дайджест просроченных тикетов", "body": \(.build_digest)}'
+      next: done
+
+  # Терминальные шаги — только success/fail, других вариантов схема не даёт.
+  nothing_to_escalate:
+    success: {}
+
+  done:
+    success: {}

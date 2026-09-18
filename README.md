@@ -153,6 +153,9 @@ knowledge_base/
 * `lockbox.payloadViewer` — для чтения секретов из Lockbox.
 * `ai.languageModels.user` — для отправки запросов в Yandex AI Studio.
 * `ydb.editor` — для управления структурой и данными базы YDB.
+* `ai.assistants.editor` — для шага `aiStudioAgent` в workflow'е автоэскалации
+  (см. «Автоэскалация тикетов — Yandex Workflows» ниже); без неё шаг падает
+  с 403 Forbidden.
 
 ## Хранение секретов в Yandex Cloud Lockbox
 
@@ -205,6 +208,77 @@ yc serverless function invoke ydb-tickets --data '{"action":"list-my-tickets","u
 ⚠️ `yc ydb yql execute` не существует — проверяйте данные только через CF
 (`list-my-tickets`) либо через консоль YDB (вкладка YQL-редактор).
 
+## Автоэскалация тикетов — Yandex Workflows (шаг 9)
+
+Отдельный pull-режим workflow по расписанию (не путать с `email-poller`,
+который тоже pull, но по таймеру раз в минуту): раз в день собирает
+просроченные тикеты, просит модель составить дайджест и шлёт его
+оператору на почту.
+
+```
+Timer (cron 09:00 Europe/Moscow)
+      │
+      ▼
+Workflow (src/workflow.yaml, YaWL 0.1, "daily-escalation")
+      │
+      ├─ select_overdue_tickets  databaseQuery → открытые тикеты,
+      │                          не обновлявшиеся дольше 24 часов (YQL SELECT)
+      ├─ has_overdue_tickets     switch → если просроченных нет,
+      │                          сразу в терминальный шаг
+      ├─ build_digest            aiStudioAgent → дайджест по выборке
+      │                          (тот же agent_id, что в AI Studio)
+      ├─ mark_escalated          databaseQuery → те же тикеты → escalated
+      │                          (YQL UPDATE с тем же условием, что и SELECT)
+      └─ send_digest             httpCall (POST) → email-sender (CF) →
+                                  SMTP-письмо оператору
+```
+
+Файлы: `src/workflow.yaml`, `src/email_sender/email_sender.py`,
+`scripts/deploy_email_sender.ps1`, `scripts/deploy_workflow.ps1`.
+
+**Почему письмо шлёт отдельная CF, а не сам workflow:** YaWL умеет только
+`httpCall`, сырой SMTP ему недоступен — `email-sender` это обычная
+Python-функция-обёртка (`smtplib.SMTP_SSL`, тот же Lockbox-секрет
+`email-credentials`, что у `email-poller`). Она открыта без
+аутентификации (`allow-unauthenticated-invoke`), потому что `httpCall` не
+передаёт IAM-токен — но адресата (`OPERATOR_EMAIL`) берёт только из
+своего окружения, а не из тела запроса, поэтому худшее, что может
+получить тот, кто узнал URL функции, — лишний дайджест оператору, а не
+рассылка на произвольный адрес.
+
+**Перед первым деплоем нужно вручную:**
+1. ✅ Промпт-шаблон/агент в AI Studio Agent Atelier создан
+   (`aaci5jd4t03rocd66520`, каталог `b1gub2v21kgnvqvtbj19`) и уже
+   подставлен в поле `promptTemplateId` шага `build_digest`
+   (`src/workflow.yaml`).
+2. ✅ `OPERATOR_EMAIL` (`nikus_07@bk.ru`) подставлен в
+   `scripts/deploy_email_sender.ps1`, функция `email-sender` задеплоена,
+   её публичный URL (`d4evkd35h3fvd0j3cgfv`) подставлен в поле `url`
+   шага `send_digest` (`src/workflow.yaml`).
+3. Задеплоить сам workflow: `.\scripts\deploy_workflow.ps1` — скрипт
+   выдаёт SA недостающую роль `ai.assistants.editor`, создаёт/обновляет
+   workflow из `src/workflow.yaml`, назначает расписание (cron `0 6 * * ? *`
+   без `--schedule-timezone` — на части сборок `yc` под Windows этот флаг
+   падает с `ERROR: Invalid timezone` из-за отсутствия IANA tzdata в
+   окружении; используем то, что Москва круглый год UTC+3 без перехода на
+   летнее время, поэтому 06:00 UTC = 09:00 по Москве всегда) и выдаёт SA
+   роли `serverless.workflows.executor` +
+   `serverless.workflows.viewer` **на сам workflow** (без них
+   scheduled-trigger не сможет его запустить, даже если SA триггера
+   совпадает с SA workflow'а).
+
+**Ручной тест до расписания:** временно замените `PT24H` на `PT1H` в
+обоих запросах `src/workflow.yaml`, чтобы существующие тикеты попали в
+выборку, задеплойте, запустите
+`yc serverless workflow execution start daily-escalation`, проверьте
+`yc serverless workflow execution get <execution-id>` и приход письма
+оператору. Затем верните `PT24H` и передеплойте.
+
+**Ретраи** заданы один раз на весь процесс через `defaultRetryPolicy` в
+`src/workflow.yaml` — только на `STEP_TIMEOUT`/5xx-коды шагов
+`databaseQuery`/`httpCall`; `STEP_PERMISSION_DENIED` (например, забытая
+роль SA) ретраями не лечится и должен падать сразу с понятной ошибкой.
+
 ## Что попробовать (готовые промпты для проверяющего)
 
 Отправьте письмо на `kir.nv.123@yandex.ru` (ответ придёт в течение ~60 сек):
@@ -247,6 +321,9 @@ yc serverless function invoke ydb-tickets --data '{"action":"list-my-tickets","u
 - Запись обеих реплик цикла (письмо клиента + ответ агента с точной
   телеметрией: `model`, `tokens_in`, `tokens_out`, `latency_ms`).
 - Логи без сырого PII (`_redact_for_log`).
+- Автоэскалация просроченных тикетов через Yandex Workflows
+  (`src/workflow.yaml`) — дайджест оператору по расписанию, см.
+  «Автоэскалация тикетов — Yandex Workflows» выше.
 
 ## Что не работает / не сделано
 
@@ -254,8 +331,15 @@ yc serverless function invoke ydb-tickets --data '{"action":"list-my-tickets","u
   реализован, используется только email.
 - Toxicity filter / PII detector в AI Studio → Moderation — не включены
   (ручной шаг в консоли, чекбоксы могут отсутствовать на вашем тарифе).
-- Сохранённый агент в AI Studio не создавался — используется inline-режим
-  Responses API (см. выше).
+- Сохранённый агент в AI Studio для основного email-агента не
+  создавался — используется inline-режим Responses API (см. выше). Для
+  workflow'а автоэскалации (шаг 9), наоборот, агент в Agent Atelier создан
+  отдельно (`aaci5jd4t03rocd66520`) — так требует поле `promptTemplateId`
+  у шага `aiStudioAgent`.
+- Workflow автоэскалации (`daily-escalation`) — код и деплой-скрипты
+  готовы, `promptTemplateId` подставлен, но сам workflow ещё не
+  задеплоен: осталось задеплоить `email-sender` и подставить его URL в
+  `send_digest` (см. «Автоэскалация тикетов — Yandex Workflows»).
 
 ## Стек
 
@@ -264,6 +348,8 @@ yc serverless function invoke ydb-tickets --data '{"action":"list-my-tickets","u
 - **RAG:** Yandex AI Studio Search Index (Vector Store) поверх `knowledge_base/`.
 - **Хранилище:** YDB Serverless (`tickets`, `messages`).
 - **Инструменты:** MCP Hub / MCP Gateway (`ydb-tickets-mcp`).
+- **Оркестрация:** Yandex Workflows (YaWL 0.1) — `daily-escalation`,
+  автоэскалация просроченных тикетов по расписанию (шаг 9).
 - **Секреты:** Yandex Lockbox (`email-credentials`, `ai-studio-api-key`,
   `ydb-endpoint`, `ydb-database`).
 - **Деплой:** `yc` CLI + PowerShell-скрипты (см. `scripts/`).
@@ -281,11 +367,14 @@ src/
 ├── email_poller/
 │   ├── email_poller.py
 │   └── requirements.txt
-└── ydb_tickets/
-    ├── index.py
-    ├── mcp-tools.yaml
-    ├── requirements.txt
-    └── schema.sql
+├── email_sender/
+│   └── email_sender.py       # SMTP-обёртка для шага httpCall (шаг 9)
+├── ydb_tickets/
+│   ├── index.py
+│   ├── mcp-tools.yaml
+│   ├── requirements.txt
+│   └── schema.sql
+└── workflow.yaml              # YaWL 0.1, workflow daily-escalation (шаг 9)
 
 scripts/
 ├── init_schema.py            # применяет schema.sql к YDB
@@ -295,6 +384,8 @@ scripts/
 ├── deploy_mcp-tools.ps1      # деплой/обновление MCP Gateway tools
 ├── deploy_kb_index.ps1       # создание Search Index из knowledge_base
 ├── deploy_trg.ps1            # деплой таймер-триггера
+├── deploy_email_sender.ps1   # деплой email-sender (шаг 9)
+├── deploy_workflow.ps1       # деплой/обновление workflow daily-escalation (шаг 9)
 
 .env.example                  # шаблон переменных для локальных скриптов
 README.md                     # этот файл
