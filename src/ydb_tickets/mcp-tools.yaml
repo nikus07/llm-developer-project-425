@@ -1,0 +1,31 @@
+- name: create-ticket
+  description: |
+    Создать новый тикет в Help Desk. Использовать когда:
+    - ответа в базе знаний нет и пользователь подтверждает, что хочет оставить обращение
+    - пользователь явно просит создать тикет / заявку / обращение
+  input_json_schema: '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"user_id":{"type":"string","description":"Идентификатор пользователя (Почта пользователя как строка)"},"category":{"type":"string","enum":["bug","docs","feature","access"],"description":"Категория обращения"},"text":{"type":"string","description":"Текст обращения. PII маскируется автоматически на стороне CF."}},"required":["user_id","category","text"],"additionalProperties":false}'
+  action:
+    function_call:
+      function_id: d4eb475e1061taq1cn8i
+      tag: $latest
+
+- name: list-my-tickets
+  description: |
+    Вернуть список ранее созданных пользователем тикетов. Использовать когда:
+    - пользователь спрашивает «где моя заявка / что с моим обращением / покажи мои тикеты»
+  input_json_schema: '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"user_id":{"type":"string","description":"Идентификатор пользователя (Почта пользователя как строка)"},"limit":{"type":"integer","minimum":1,"maximum":50,"default":20,"description":"Сколько последних тикетов вернуть"}},"required":["user_id"],"additionalProperties":false}'
+  action:
+    function_call:
+      function_id: d4eb475e1061taq1cn8i
+      tag: $latest
+
+- name: append-message
+  description: |
+    Добавить запись в историю диалога по тикету. Использовать когда:
+    - после своего ответа агент сохраняет его в историю (role=agent)
+    - пользователь добавляет уточнение к существующему обращению (role=user)
+  input_json_schema: '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"ticket_id":{"type":"string","description":"ID тикета (из ответа create-ticket)"},"role":{"type":"string","enum":["user","agent"]},"text":{"type":"string","description":"Текст сообщения"},"model":{"type":"string","description":"Какая модель отвечала (для role=agent)"},"tokens_in":{"type":"integer"},"tokens_out":{"type":"integer"},"latency_ms":{"type":"integer"}},"required":["ticket_id","role","text"],"additionalProperties":false}'
+  action:
+    function_call:
+      function_id: d4eb475e1061taq1cn8i
+      tag: $latest

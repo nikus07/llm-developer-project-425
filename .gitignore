@@ -1,1 +1,13 @@
 ﻿.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Временные файлы деплоя (архивы, тестовые payload'ы)
+tmp/
+
+# IDE
+.vscode/
+.idea/
